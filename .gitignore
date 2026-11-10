@@ -1,0 +1,19 @@
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Large outputs: saved logits, checkpoints, model weights
+logits/
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.npz
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
