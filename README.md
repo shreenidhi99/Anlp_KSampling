@@ -66,3 +66,34 @@ How they fit together
 04      → method works on real logits; accuracy unchanged
 05      → method is faster on real data
 06      → where it matters in real serving
+Issues log
+
+Problems found while running the notebooks, newest last. Each entry: what happened, the cause, the fix, and what still needs doing.
+
+1. Notebook 02/04: model does not fit on the GPUs as written (2026-11-15)
+   - Symptom: Notebook 04 hard-codes two GPUs with 37 GiB each, but on the shared 8 x A100 40GB box no GPU had more than ~14 GB free; ~52 GB of bf16 weights need 4-5 GPUs there.
+   - Fix: both notebooks now start with a GPU-selection cell that sets CUDA_VISIBLE_DEVICES before torch is imported (auto-picks the N_GPUS GPUs with the most free memory, or MANUAL_GPUS), and size max_memory from each GPU's real free memory minus 4 GB headroom.
+   - Note: setting CUDA_VISIBLE_DEVICES after CUDA has started in a kernel does nothing; restart the kernel first. Free memory changes as other users' jobs grow; raise N_GPUS if loading fails with an offload error.
+
+2. Notebook 02: Colab-only code (2026-11-15)
+   - Symptom: the logits-saving cell mounted Google Drive (google.colab), which crashes outside Colab.
+   - Fix: USE_DRIVE = False by default; logits go to ./logits.
+
+3. Notebook 02: GSM8K too small to compare variants (2026-11-15)
+   - Change: N_GSM = 250 (was 20). Results are appended per problem to ./runs/nb02/gsm8k_250.csv and the cell resumes from it after an interruption.
+   - Caveat: scoring takes the last number in the answer and compares strings, so "18.0" vs "18" or a trailing number counts as wrong. Same for all variants, so comparisons are fair; absolute accuracy may read low.
+
+4. Notebook 04/05: certified sampler made wrong commit decisions (2026-11-15)
+   - Symptom: Notebook 04 run reported 8 of 400 step checks with commit_mismatch = 1 (k=64: 4/100, k=256: 2/100, k=1024: 2/100, k=16: 0/100; stop mismatches 0/400). Mismatches must be 0.
+   - Cause: topk_stats in dg_sampling.py computed the bounds in float32 with (a) the normalizer lse unshifted (large values lose ~1e-6) and (b) tail mass m = 1 - sum(p) (catastrophic cancellation when m is ~1e-7). The resulting [lo, hi] did not contain the true entropy: on the 6 saved logits steps, 77-256 of 256 slots violated the bounds at every k. A mismatch appears only when such a slot sits at the commit threshold, hence the low rate. Notebook 03 had already been fixed for this (commit 6e21297) but the fix was never copied into the %%writefile dg_sampling.py cell of Notebooks 04 and 05.
+   - Fix: ported Notebook 03's topk_stats (normalizer shifted by the row max, m = -expm1(logsumexp(lp)), [lo, hi] widened by NUM_EPS) into both %%writefile cells.
+   - Margin choice: on the saved logits, NUM_EPS = 2e-4 (Notebook 03's value) gives 0 violations but refines ~47% of slots, because the commit rule sums 256 per-slot margins against a 0.1 budget. 2e-5 gives 0 violations and ~10% refined; 5e-6 and smaller already violate. Set to 2e-5. This is validated on only 6 steps of one prompt; the Notebook 04 rerun checks it on every step of 9 prompts.
+   - Old results invalid: runs/nb04/certified_real_bf16.csv, refinement_by_step.png and the "certified k64" rows of gsm8k_bf16.csv were produced with the broken bounds. Rerun Notebook 04 from section 5.
+   - Open: even after the shift, float32 leaves ~5e-6 of error (and exact_entropy, the reference, is itself float32). Computing the top-k entropy terms and the reference in float64 may allow a much smaller margin and bring refinement back toward ~1%.
+   - Also affected: Notebook 02 has its own inline copy of topk_stats (section 5) with the same float32 bug. Its GSM8K-250 run (runs/nb02/gsm8k_250.csv, finished 2026-11-15) gave stock 96.8%, certified k64 96.4%, topk64 renorm 94.4%; the certified k64 row used the broken bounds. stock and topk64 renorm rows are unaffected. Notebook 02's copy is not yet fixed.
+
+5. Notebook 04: load failed with ValueError in accelerate_dispatch (2026-11-15)
+   - Symptom: with N_GPUS = 6 and HEADROOM_GB = 4, max_memory summed to 61 GiB, weights loaded, then from_pretrained raised ValueError while dispatching.
+   - Cause: not enough GPU budget. The loaded model takes ~54 GB (Notebook 02's run used ~54 GB), and device_map='auto' places whole decoder layers (~1.5 GB each with experts), so each GPU can waste up to a layer at its budget edge; the overflow went to CPU/disk offload, which the dispatch step rejects.
+   - Fix: restart the kernel (the failed load keeps holding GPU memory), then N_GPUS = 7 and HEADROOM_GB = 3. Aim for a max_memory total of ~70 GiB or more.
+   - Rerun result (2026-11-15, NUM_EPS = 2e-5, 7 GPUs): 0/400 commit and 0/400 stop mismatches at every k. Refinement ~10% of slots at every k (k=16: 10.8%, k=64/256/1024: 10.0%), flat in k, so it is set by the eps margin rather than the tail mass; reducing it needs the float64 route above. GSM8K-30: stock 96.7%, certified k64 96.7%, topk64 renorm 93.3%.
