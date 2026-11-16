@@ -97,3 +97,8 @@ Problems found while running the notebooks, newest last. Each entry: what happen
    - Cause: not enough GPU budget. The loaded model takes ~54 GB (Notebook 02's run used ~54 GB), and device_map='auto' places whole decoder layers (~1.5 GB each with experts), so each GPU can waste up to a layer at its budget edge; the overflow went to CPU/disk offload, which the dispatch step rejects.
    - Fix: restart the kernel (the failed load keeps holding GPU memory), then N_GPUS = 7 and HEADROOM_GB = 3. Aim for a max_memory total of ~70 GiB or more.
    - Rerun result (2026-11-15, NUM_EPS = 2e-5, 7 GPUs): 0/400 commit and 0/400 stop mismatches at every k. Refinement ~10% of slots at every k (k=16: 10.8%, k=64/256/1024: 10.0%), flat in k, so it is set by the eps margin rather than the tail mass; reducing it needs the float64 route above. GSM8K-30: stock 96.7%, certified k64 96.7%, topk64 renorm 93.3%.
+
+6. dg_certified.py (notebook 07): same float32 bounds bug (2026-11-15)
+   - Found after pulling commit c275708. Its topk_stats still uses the unshifted lse and m = 1 - sum(p), with a pad of 1e-7 + 1e-6 * hi.
+   - On the 6 saved logits steps (runs/nb04/step_*.pt), 515-802 of 1536 slots fall outside [lo, hi] (k=16: 515, k=64: 583, k=256: 671, k=1024: 802). The fixed dg_sampling.topk_stats gives 0. Expect non-zero decision mismatches from notebook 07 until it is fixed.
+   - Not yet fixed. Port the shifted normalizer and expm1 tail mass; the pad then needs to be about 2e-5 absolute (5e-6 still violated in issue 4's test).
