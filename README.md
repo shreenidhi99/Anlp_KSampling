@@ -1,4 +1,4 @@
-The six notebooks at a glance
+The notebooks at a glance (01-07)
 #	Notebook	Needs the model?	GPU	Answers
 01	topk sampling harness	No	1 GPU (T4 or better)	Is sampling expensive, and does top-k fix it?
 02	diffusers smoke test	Yes (4-bit)	1 A100	Does the model run, and does my scheduler reproduce the stock decisions?
@@ -102,3 +102,14 @@ Problems found while running the notebooks, newest last. Each entry: what happen
    - Found after pulling commit c275708. Its topk_stats still uses the unshifted lse and m = 1 - sum(p), with a pad of 1e-7 + 1e-6 * hi.
    - On the 6 saved logits steps (runs/nb04/step_*.pt), 515-802 of 1536 slots fall outside [lo, hi] (k=16: 515, k=64: 583, k=256: 671, k=1024: 802). The fixed dg_sampling.topk_stats gives 0. Expect non-zero decision mismatches from notebook 07 until it is fixed.
    - Not yet fixed. Port the shifted normalizer and expm1 tail mass; the pad then needs to be about 2e-5 absolute (5e-6 still violated in issue 4's test).
+   - Fixed (2026-11-16): topk_stats now computes lse, the top-k terms and the tail mass in float64 (m = -expm1(logsumexp(top-k log-probs))). The pad depends on the reference (dc.PADS): 'stock' = 2e-5 (matches the float32 stock decisions; the stock entropy itself carries ~1e-5 of float32 rounding because logits / T reach ~75), 'exact' = 1e-9 (matches float64 entropies). Notebook 07 has a pad-check cell (dc.pad_sweep on runs/nb04/step_*.pt) to confirm 0 violations before Test B.
+   - The 2026-11-16 notebook 07 run (commit 2e1fc06) used the unfixed file: its GSM8K accuracy/steps are usable, its Test B mismatch counts are not. Rerun the pad check and Test B.
+
+7. Notebook 07 checks: ties, argmax and self-conditioning bound (2026-11-16)
+   - The LM head runs in bf16, so exactly equal logits and entropies are common. torch.topk orders ties arbitrarily while torch.argmax takes the lowest index; the certified stop now breaks ties like argmax (this caused the sh_argmax_mismatch counts at k=16). The stock commit sort is not stable either: Test B now reports sh_commit_mismatch_ties (mismatches where the differing slots have identical stock entropy, i.e. both choices follow the rule).
+   - Test B also reports mismatches against float64 entropies (sh_commit_mismatch_exact, sh_stop_mismatch_exact).
+   - sh_sc_bound_violations counted thousands of slots because the stock self-conditioning reference is itself bf16-rounded (~0.2% relative error even when the tail is empty); the check now allows 1% of the reference norm.
+   - Test A: on the code and chat prompts the original pipeline does not reproduce itself with the same seed (GPU non-determinism across 4 GPUs), so only the math prompt is a valid check. Open: deterministic mode or a step-level replay test.
+
+8. Notebook 02: certified GSM8K-250 row still from buggy bounds (open)
+   - Its inline topk_stats was never fixed (issue 4). Use notebook 07 for the certified GSM8K numbers instead.

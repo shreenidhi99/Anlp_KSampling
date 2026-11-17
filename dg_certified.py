@@ -34,20 +34,42 @@ import torch.nn.functional as F
 
 E_STOP = 0.005
 
+# What "exact" means. The certified decisions are guaranteed equal to the commit/stop rule applied to:
+#   'stock' : the float32 entropies the stock code computes. Its own rounding is ~1e-5 per slot (logits / T reach
+#             ~75, where float32 spacing is ~8e-6), so the ranges need a pad of ~2e-5 (README issue 4: 5e-6 violated,
+#             2e-5 clean) and more slots get refined.
+#   'exact' : the true entropies, computed in float64. Tiny pad, little refinement. The stock float32 code then
+#             differs from this reference only by its own rounding.
+PADS = {'stock': 2e-5, 'exact': 1e-9}
+
 
 # ============================================================================ basic pieces
 def chunked_logsumexp(x, tau, chunk=32_768):
-    """log-sum-exp of x / tau over the last dim in fp32, one vocabulary chunk at a time (no full fp32 copy)."""
+    """log-sum-exp of x / tau over the last dim in float64, one vocabulary chunk at a time (no full copy)."""
     out = None
     for s in range(0, x.shape[-1], chunk):
-        part = torch.logsumexp(x[..., s:s + chunk].float() / tau, dim=-1)
+        part = torch.logsumexp(x[..., s:s + chunk].double() / tau, dim=-1)
         out = part if out is None else torch.logaddexp(out, part)
     return out
 
 
 def stock_entropy(rows, tau):
-    """Entropy computed exactly the way the stock scheduler and pipeline compute it."""
+    """Entropy computed exactly the way the stock scheduler and pipeline compute it (float32)."""
     return torch.distributions.Categorical(logits=rows.float() / tau).entropy()
+
+
+def exact_entropy64(rows, tau, row_chunk=16):
+    """True entropy in float64, a few rows at a time. rows: [..., V]."""
+    flat = rows.reshape(-1, rows.shape[-1])
+    out = torch.empty(flat.shape[0], dtype=torch.float64, device=rows.device)
+    for s in range(0, flat.shape[0], row_chunk):
+        lp = torch.log_softmax(flat[s:s + row_chunk].double() / tau, dim=-1)
+        out[s:s + row_chunk] = -(lp.exp() * lp).sum(-1)
+    return out.view(rows.shape[:-1])
+
+
+def refine_fn(reference):
+    return stock_entropy if reference == 'stock' else exact_entropy64
 
 
 def n_commit(e, b):
@@ -63,21 +85,52 @@ def commit_exact(e, b):
     return keep
 
 
-def topk_stats(logits, tau, k, abs_pad=1e-7, rel_pad=1e-6):
-    """Exact top-k probabilities, tail mass m, and an entropy interval [lo, hi] that contains the true entropy.
+def topk_stats(logits, tau, k, reference='stock', abs_pad=None, rel_pad=1e-6):
+    """Exact top-k probabilities, tail mass m, and an entropy range [lo, hi] that contains the reference entropy.
     lo: tail mass on as few tokens as possible.  hi: tail mass spread uniformly over the other V-k tokens.
-    A small relative pad absorbs float32 rounding (the fixed 2e-4 margin inflated refinement)."""
+    Everything is computed in float64 (README issues 4 and 6: float32 lost the normalizer and the tail mass):
+      * the normalizer lse is a chunked float64 log-sum-exp
+      * the tail mass is m = -expm1(logsumexp(top-k log-probs)), accurate even when m ~ 1e-12
+    The pad (PADS[reference] unless given) covers the rounding of the reference entropy.
+    lo/hi are float32 for reference='stock' (the stock code sums entropies in float32), float64 for 'exact'."""
     V = logits.shape[-1]
     vals, idx = torch.topk(logits, k, dim=-1)
-    lse = chunked_logsumexp(logits, tau)
-    lp = vals.float() / tau - lse.unsqueeze(-1)
+    lse = chunked_logsumexp(logits, tau)                                  # float64
+    lp = vals.double() / tau - lse.unsqueeze(-1)
     p = lp.exp()
     h = -(p * lp).sum(-1)
-    m = (1.0 - p.sum(-1)).clamp(0.0, 1.0)
-    hi = h - m * torch.log(m.clamp_min(1e-30)) + (m * math.log(V - k) if V > k else 0.0)
-    lo = h - m * torch.log(torch.minimum(m, p[..., -1]).clamp_min(1e-30))
-    pad = abs_pad + rel_pad * hi
-    return dict(idx=idx, p=p, m=m, lse=lse, h=h, lo=(lo - pad).clamp_min(0.0), hi=hi + pad)
+    m = (-torch.expm1(torch.logsumexp(lp, dim=-1))).clamp(0.0, 1.0)
+    hi = h - m * torch.log(m.clamp_min(1e-300)) + (m * math.log(V - k) if V > k else 0.0)
+    lo = h - m * torch.log(torch.minimum(m, p[..., -1]).clamp_min(1e-300))
+    pad = (PADS[reference] if abs_pad is None else abs_pad) + rel_pad * hi
+    lo, hi = (lo - pad).clamp_min(0.0), hi + pad
+    out_dtype = torch.float32 if reference == 'stock' else torch.float64
+    return dict(idx=idx, p=p.float(), m=m.float(), lse=lse.float(), h=h.float(),
+                lo=lo.to(out_dtype), hi=hi.to(out_dtype))
+
+
+def pad_sweep(logits_steps, taus, ks=(16, 64, 256, 1024), pads=(1e-6, 5e-6, 2e-5), b=0.1,
+              references=('stock', 'exact')):
+    """For saved logits: how many slots fall outside [lo, hi] (must be 0) and what fraction gets refined,
+    for each reference, k and pad. logits_steps: list of [B, C, V] tensors; taus: matching temperatures."""
+    rows = []
+    for ref in references:
+        for L, tau in zip(logits_steps, taus):
+            e = refine_fn(ref)(L, tau)
+            for k in ks:
+                for pad in pads:
+                    st = topk_stats(L, tau, k, reference=ref, abs_pad=pad)
+                    viol = int(((e.to(st['lo'].dtype) < st['lo']) | (e.to(st['hi'].dtype) > st['hi'])).sum())
+                    refined = 0
+                    for i in range(L.shape[0]):
+                        _, r = certified_commit_row(st['lo'][i], st['hi'][i],
+                                                    lambda pos, i=i: refine_fn(ref)(L[i, pos], tau), b)
+                        refined += r
+                    rows.append(dict(reference=ref, k=k, pad=pad, violations=viol,
+                                     refined_pct=100 * refined / (L.shape[0] * L.shape[1])))
+    import pandas as pd
+    return pd.DataFrame(rows).groupby(['reference', 'k', 'pad'], as_index=False).agg(
+        violations=('violations', 'sum'), refined_pct=('refined_pct', 'mean'))
 
 
 # ============================================================================ certified decisions
@@ -204,13 +257,14 @@ def make_scheduler_class():
             logits = model_output
             B, C, V = logits.shape
             g = generator if (generator is not None and generator.device == logits.device) else None
-            st = topk_stats(logits, T, self.k)
+            st = topk_stats(logits, T, self.k, reference=rt.reference)
             rt.last['st'] = st
             refined = 0
             if self.mode == 'certified':
                 rows = []
+                ref_fn = refine_fn(rt.reference)
                 for i in range(B):
-                    refine = lambda pos, i=i: stock_entropy(logits[i, pos], T)
+                    refine = lambda pos, i=i: ref_fn(logits[i, pos], T)
                     kp, r = certified_commit_row(st['lo'][i], st['hi'][i], refine, b)
                     rows.append(kp)
                     refined += r
@@ -249,6 +303,7 @@ def make_scheduler_class():
 _EMB_CACHE = {}
 
 
+@torch.no_grad()
 def _embedding_stats(W, chunk=16_384):
     """Sum of all embedding rows and the largest row norm, computed once per table, in chunks (no 3 GB fp32 copy)."""
     key = (W.data_ptr(), tuple(W.shape))
@@ -271,8 +326,11 @@ class Runtime:
     shadow=True (with the stock scheduler): also compute the certified decisions and the top-k self-cond,
           and record any disagreement with the stock ones. Nothing the pipeline uses is changed."""
 
-    def __init__(self, decoder, sc='full', sc_tail='drop', stop='certified', k=64, shadow=False, timing=False):
+    def __init__(self, decoder, sc='full', sc_tail='drop', stop='certified', k=64, shadow=False, timing=False,
+                 reference='stock'):
+        assert reference in PADS, reference
         self.sc, self.sc_tail, self.stop, self.k, self.shadow, self.timing = sc, sc_tail, stop, k, shadow, timing
+        self.reference = reference
         self.W = decoder.embed_tokens.weight
         self.scale = decoder.embed_tokens.embed_scale
         self.W_sum, self.max_row_norm = _embedding_stats(self.W)
@@ -296,7 +354,8 @@ class Runtime:
     def reset_counters(self):
         self.c = dict(steps=0, blocks=0, slots=0, refined_commit=0, refined_stop=0, tail_samples=0,
                       t_sampler=0.0, t_sc=0.0, t_stop=0.0,
-                      sh_steps=0, sh_commit_mismatch_rows=0, sh_stop_mismatch=0, sh_stop_checks=0,
+                      sh_steps=0, sh_commit_mismatch_rows=0, sh_commit_mismatch_ties=0, sh_commit_mismatch_exact=0,
+                      sh_stop_mismatch_exact=0, sh_stop_mismatch=0, sh_stop_checks=0,
                       sh_argmax_mismatch=0, sh_refined_commit=0, sh_refined_stop=0, sh_slots=0,
                       sh_tail_mass=0.0, sh_sc_err_drop=0.0, sh_sc_err_renorm=0.0, sh_sc_err_mean=0.0,
                       sh_sc_bound_violations=0)
@@ -340,7 +399,7 @@ class Runtime:
             ret = None
         elif self.sc == 'topk':
             if st is None:
-                st = topk_stats(L, T, self.k)
+                st = topk_stats(L, T, self.k, reference=self.reference)
                 self.last['st'] = st
             self.pending = soft_topk(st, self.W, self.scale, self.sc_tail, self.W_sum)
             ret = None
@@ -355,9 +414,17 @@ class Runtime:
             assert pred_logits is not None, "stop='stock' needs the stock scheduler"
             a = pred_logits.argmax(dim=-1)
             if self.shadow and st is not None:
-                self.c['sh_argmax_mismatch'] += int((a != st['idx'][..., 0]).sum())
+                self.c['sh_argmax_mismatch'] += int((a != self._argmax_like_stock(st)).sum())
             return a
-        return st['idx'][..., 0]                        # top-1 of the top-k is the argmax
+        return self._argmax_like_stock(st)
+
+    def _argmax_like_stock(self, st):
+        """Top-1 with the same tie-break as torch.argmax (lowest index among equal maxima).
+        The LM head runs in bf16, so exactly equal logits are common and topk's own order among ties is arbitrary."""
+        L = self.last['logits']
+        v = L.gather(-1, st['idx'])
+        tied = v == v.max(-1, keepdim=True).values
+        return st['idx'].masked_fill(~tied, L.shape[-1]).min(-1).values
 
     def stop_confident(self, scheduler_output, pred_logits, threshold, stable):
         t0 = self.tic()
@@ -367,6 +434,8 @@ class Runtime:
             if self.shadow and st is not None:
                 cert = self._certified_confident(L, T, st, threshold, torch.ones_like(conf), shadow=True)
                 self.c['sh_stop_mismatch'] += int((cert != conf).sum())
+                conf64 = exact_entropy64(L, T).mean(-1) < threshold
+                self.c['sh_stop_mismatch_exact'] += int((cert != conf64).sum())
                 self.c['sh_stop_checks'] += conf.numel()
         elif self.stop == 'certified':
             conf = self._certified_confident(L, T, st, threshold, stable)
@@ -382,7 +451,7 @@ class Runtime:
         for i in range(L.shape[0]):
             if not bool(stable[i]):                     # the pipeline ANDs with `stable`, so skip the work
                 continue
-            refine = lambda pos, i=i: stock_entropy(L[i, pos], T)
+            refine = lambda pos, i=i: refine_fn(self.reference)(L[i, pos], T)
             ans, r = certified_mean_below(st['lo'][i], st['hi'][i], refine, threshold)
             out[i] = ans
             self.c['sh_refined_stop' if shadow else 'refined_stop'] += r
@@ -390,12 +459,23 @@ class Runtime:
 
     # ---- shadow checks (stock scheduler drives; we only compare)
     def shadow_commit(self, logits, T, b, stock_keep):
-        st = topk_stats(logits, T, self.k)
+        st = topk_stats(logits, T, self.k, reference=self.reference)
         self.last['st'] = st
+        ref_fn = refine_fn(self.reference)
         for i in range(logits.shape[0]):
-            refine = lambda pos, i=i: stock_entropy(logits[i, pos], T)
+            refine = lambda pos, i=i: ref_fn(logits[i, pos], T)
             kp, r = certified_commit_row(st['lo'][i], st['hi'][i], refine, b)
-            self.c['sh_commit_mismatch_rows'] += int((kp != stock_keep[i]).any())
+            # vs the true (float64) entropies
+            self.c['sh_commit_mismatch_exact'] += int((kp != commit_exact(exact_entropy64(logits[i], T), b)).any())
+            # vs the stock float32 decision the pipeline actually used
+            diff = kp != stock_keep[i]
+            if bool(diff.any()):
+                self.c['sh_commit_mismatch_rows'] += 1
+                # Tie? The stock sort is not stable: slots with exactly equal entropy at the cut-off can go either way.
+                e = stock_entropy(logits[i], T)
+                ed = e[diff]
+                if bool((ed == ed[0]).all()) and int(kp.sum()) == int(stock_keep[i].sum()):
+                    self.c['sh_commit_mismatch_ties'] += 1
             self.c['sh_refined_commit'] += r
         self.c['sh_steps'] += 1
         self.c['sh_slots'] += logits.shape[0] * logits.shape[1]
@@ -412,7 +492,8 @@ class Runtime:
             err = (approx - full).norm(dim=-1)
             self.c[f'sh_sc_err_{tail}'] += float((err / nf).mean())
             if tail == 'drop':
-                bound = st['m'].to(err.device) * self.max_row_norm * float(self.scale) * 1.01 + 0.05
+                # + bf16 rounding of the stock reference itself (probs and matmul are bf16): ~1% of its norm
+                bound = st['m'].to(err.device) * self.max_row_norm * float(self.scale) + 0.01 * nf
                 self.c['sh_sc_bound_violations'] += int((err > bound).sum())
 
     def summary(self):
@@ -426,6 +507,9 @@ class Runtime:
         if c['sh_steps']:
             n = c['sh_steps']
             s.update(sh_commit_mismatch_rows=c['sh_commit_mismatch_rows'],
+                     sh_commit_mismatch_ties=c['sh_commit_mismatch_ties'],
+                     sh_commit_mismatch_exact=c['sh_commit_mismatch_exact'],
+                     sh_stop_mismatch_exact=c['sh_stop_mismatch_exact'],
                      sh_stop_mismatch=c['sh_stop_mismatch'], sh_stop_checks=c['sh_stop_checks'],
                      sh_argmax_mismatch=c['sh_argmax_mismatch'],
                      sh_refined_commit_pct=100 * c['sh_refined_commit'] / c['sh_slots'],
