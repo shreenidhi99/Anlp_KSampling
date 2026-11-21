@@ -36,15 +36,6 @@ E_STOP = 0.005
 
 
 # ============================================================================ basic pieces
-def chunked_logsumexp(x, tau, chunk=32_768):
-    """log-sum-exp of x / tau over the last dim in fp32, one vocabulary chunk at a time (no full fp32 copy)."""
-    out = None
-    for s in range(0, x.shape[-1], chunk):
-        part = torch.logsumexp(x[..., s:s + chunk].float() / tau, dim=-1)
-        out = part if out is None else torch.logaddexp(out, part)
-    return out
-
-
 def stock_entropy(rows, tau):
     """Entropy computed exactly the way the stock scheduler and pipeline compute it."""
     return torch.distributions.Categorical(logits=rows.float() / tau).entropy()
@@ -63,21 +54,38 @@ def commit_exact(e, b):
     return keep
 
 
-def topk_stats(logits, tau, k, abs_pad=1e-7, rel_pad=1e-6):
+def chunked_logsumexp_shifted(x, tau, shift, chunk=32_768):
+    """log-sum-exp of (x - shift) / tau, one vocabulary chunk at a time. shift is the row max, so the
+    result is near 0, where float32 is precise (an unshifted value near 45 at tau=0.4 loses ~4e-6)."""
+    out = None
+    for s in range(0, x.shape[-1], chunk):
+        part = torch.logsumexp((x[..., s:s + chunk].float() - shift) / tau, dim=-1)
+        out = part if out is None else torch.logaddexp(out, part)
+    return out
+
+
+# Margin on [lo, hi] for float32 rounding. 2e-5 is the smallest tested value with 0 bound violations on the
+# saved real logits (5e-6 already violates); 2e-4 is also valid but refines ~47% of slots. See README, issue 4.
+NUM_EPS = 2e-5
+
+
+def topk_stats(logits, tau, k, eps=NUM_EPS):
     """Exact top-k probabilities, tail mass m, and an entropy interval [lo, hi] that contains the true entropy.
     lo: tail mass on as few tokens as possible.  hi: tail mass spread uniformly over the other V-k tokens.
-    A small relative pad absorbs float32 rounding (the fixed 2e-4 margin inflated refinement)."""
+    float32-safe (same as notebooks 03-05): normalizer relative to the row max, tail mass via expm1
+    instead of 1 - sum(p), and [lo, hi] widened by eps for rounding error."""
     V = logits.shape[-1]
-    vals, idx = torch.topk(logits, k, dim=-1)
-    lse = chunked_logsumexp(logits, tau)
-    lp = vals.float() / tau - lse.unsqueeze(-1)
+    vals, idx = torch.topk(logits, k, dim=-1)                     # sorted, largest first
+    top1 = vals[..., :1].float()                                  # row max
+    lse_s = chunked_logsumexp_shifted(logits, tau, top1)          # normalizer relative to the max (near 0)
+    lp = (vals.float() - top1) / tau - lse_s.unsqueeze(-1)
     p = lp.exp()
     h = -(p * lp).sum(-1)
-    m = (1.0 - p.sum(-1)).clamp(0.0, 1.0)
+    m = (-torch.expm1(torch.logsumexp(lp, dim=-1))).clamp(0.0, 1.0)   # 1 - sum(p), computed stably
     hi = h - m * torch.log(m.clamp_min(1e-30)) + (m * math.log(V - k) if V > k else 0.0)
     lo = h - m * torch.log(torch.minimum(m, p[..., -1]).clamp_min(1e-30))
-    pad = abs_pad + rel_pad * hi
-    return dict(idx=idx, p=p, m=m, lse=lse, h=h, lo=(lo - pad).clamp_min(0.0), hi=hi + pad)
+    lse = top1.squeeze(-1) / tau + lse_s                          # unshifted normalizer, same meaning as before
+    return dict(idx=idx, p=p, m=m, lse=lse, h=h, lo=(lo - eps).clamp_min(0.0), hi=hi + eps)
 
 
 # ============================================================================ certified decisions
