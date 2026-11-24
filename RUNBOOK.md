@@ -84,9 +84,9 @@ Run order, and what to look for:
 
 Report back: the pad-check table, Test A and Test B tables, and the GSM8K summary + paired comparison.
 
-## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 GPUs, ~1.5-3 hours)
+## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 or 4 GPUs, ~1-2 hours)
 
-Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). It starts one vLLM server (tensor parallel 2) per configuration and `--max-num-seqs` value, sends GSM8K questions at that concurrency, and stops the server again. Settings at the top of the first code cell: `N_GPUS` (2 or 4: the tensor-parallel size; 4 also adds batch limits 32 and 64), `GPUS` (None = the N_GPUS GPUs with the most free memory; `--gpu-memory-utilization` is then set from their free memory), `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]). If the first cell warns that less than ~32 GB per GPU is free, free the GPUs before running.
+Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). For each configuration it starts **one** vLLM server with the largest `--max-num-seqs` that fits (trying the largest first; failed starts are recorded), sweeps the number of concurrent requests on that server, then stops it. One server per configuration keeps the GPUs reserved for the whole sweep on a shared machine. Settings at the top of the first code cell: `N_GPUS` (2 or 4: the tensor-parallel size; 4 also adds batch limits 32 and 64), `GPUS` (None = the N_GPUS GPUs with the most free memory; `--gpu-memory-utilization` is then set from their free memory), `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]). If the first cell warns that less than ~32 GB per GPU is free, free the GPUs before running.
 
 ```bash
 source .venv-vllm/bin/activate
@@ -102,7 +102,7 @@ Success criteria:
 - Kernel check: argmax and sample identical, entropy/probs differences at rounding level, copy/vLLM time ratio near 1.
 - `plugin_active` is True on every `topk64` and `topk64_exact` row (the plugin loaded in the server; the log line also shows `sample=vllm` or `sample=topk_exact`).
 - Accuracy of all three configurations within noise of each other.
-- Report the throughput table with `speedup`, the latency plot, and the largest `--max-num-seqs` that started for each config. A `failed_to_start` row with `oom=True` at large batch limits is a result, not an error.
+- Report the throughput table with `speedup`, the latency plot, and the largest `--max-num-seqs` that started for each config. A `failed_to_start` row with `oom=True` at large batch limits is a result, not an error; compare the largest `--max-num-seqs` that started and the KV-cache memory between configurations.
 
 ## 4. After a run
 
