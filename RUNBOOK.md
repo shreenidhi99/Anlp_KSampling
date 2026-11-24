@@ -49,6 +49,27 @@ Success criteria:
 
 Report back: the correctness table, the `Summary` table, the memory table, and the plot.
 
+## 1b. Notebook 08 against the installed vLLM kernel (separate environment)
+
+Notebook 08 runs fine without vLLM, using a copy of vLLM's kernel. To also check the copy against **vLLM's own kernel** and time it, run the same notebook in a separate environment with vLLM installed. Keep it separate: installing vLLM pulls in its own PyTorch version and would change `.venv-2`.
+
+```bash
+cd /data/users/shreenis/private/Anlp_KSampling
+python3 -m venv .venv-vllm
+source .venv-vllm/bin/activate
+pip install -U pip
+pip install -U vllm                                  # latest release
+python -c "from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats; print('ok')"
+# if that import fails, the release predates DiffusionGemma support; install a nightly build instead
+# (see vLLM's installation docs for the current nightly index), then repeat the check
+pip install nbconvert ipykernel pandas matplotlib huggingface_hub safetensors
+python -m ipykernel install --user --name anlp-vllm
+jupyter nbconvert --to notebook --execute --output 08_sampler_microbenchmark_vllm.ipynb \
+  --ExecutePreprocessor.kernel_name=anlp-vllm --ExecutePreprocessor.timeout=-1 08_sampler_microbenchmark.ipynb
+```
+
+Success criteria (section 2b of the notebook): argmax and sample identical, entropy and probs differences at rounding level (~1e-6 or smaller). In the Summary table, `copy vs installed kernel (ratio)` should be close to 1, and `speedup vs installed vllm (k=64)` is the headline number.
+
 ## 2. Notebook 07: exactness checks and GSM8K (2 GPUs, bf16 model)
 
 Needs ~70 GB of free GPU memory across the selected GPUs (model ~54 GB + headroom). In the first cell set `N_GPUS = 2` and, if needed, `MANUAL_GPUS = '0,1'` (the two free GPUs). `REFERENCE = 'stock'` is the default.

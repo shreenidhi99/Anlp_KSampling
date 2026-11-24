@@ -228,3 +228,21 @@ def make_batch(saved, B, CL, device, n_steps=48, t_min=0.4, t_max=0.8):
         temps.append(t_min + (t_max - t_min) * (n_steps - step) / n_steps)
     L = torch.cat(rows).to(device).contiguous()
     return L, torch.tensor(temps, dtype=torch.float32, device=device)
+
+# ============================================================================ the real vLLM kernel (optional)
+def load_vllm_kernel():
+    """vLLM's own `sample_row_stats`, if vLLM (with DiffusionGemma support) is installed in this environment.
+    Returns (function, version string) or (None, reason)."""
+    try:
+        import vllm
+        from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats
+        return sample_row_stats, getattr(vllm, '__version__', '?')
+    except Exception as e:                      # not installed, or a version without DiffusionGemma
+        return None, f'{type(e).__name__}: {e}'
+
+
+def path_vllm_pkg(L, temps, CL, E, scale, vllm_fn, seed=0):
+    """vLLM's current path using the installed vLLM kernel: stats + bf16 probs, then the full hint matmul."""
+    argmax, sample, ent, probs = vllm_fn(L, temps, CL, seed, E.dtype)
+    hint = torch.matmul(probs, E) * scale
+    return dict(argmax=argmax, entropy=ent, hint=hint)
