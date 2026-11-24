@@ -1,4 +1,4 @@
-# Runbook: notebooks 08 and 07
+# Runbook: notebooks 08, 07 and 09
 
 Step-by-step instructions for running the current experiments on the GPU machine. Written so that a person or a coding agent (e.g. Claude Code in the terminal or VS Code) can follow them top to bottom and report back.
 
@@ -49,26 +49,23 @@ Success criteria:
 
 Report back: the correctness table, the `Summary` table, the memory table, and the plot.
 
-## 1b. Notebook 08 against the installed vLLM kernel (separate environment)
+## 1b. vLLM environment (needed for notebook 09)
 
-Notebook 08 runs fine without vLLM, using a copy of vLLM's kernel. To also check the copy against **vLLM's own kernel** and time it, run the same notebook in a separate environment with vLLM installed. Keep it separate: installing vLLM pulls in its own PyTorch version and would change `.venv-2`.
+Notebook 09 runs real vLLM. Keep it in a separate environment: installing vLLM pulls in its own PyTorch version and would change `.venv-2`. vLLM's DiffusionGemma recipe lists vLLM >= 0.24.0.
 
 ```bash
 cd /data/users/shreenis/private/Anlp_KSampling
 python3 -m venv .venv-vllm
 source .venv-vllm/bin/activate
 pip install -U pip
-pip install -U vllm                                  # latest release
-python -c "from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats; print('ok')"
-# if that import fails, the release predates DiffusionGemma support; install a nightly build instead
-# (see vLLM's installation docs for the current nightly index), then repeat the check
-pip install nbconvert ipykernel pandas matplotlib huggingface_hub safetensors
+pip install -U vllm
+python -c "import vllm; from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats; print(vllm.__version__, 'ok')"
+# if that import fails, this vLLM predates DiffusionGemma support: install a newer release or a nightly build
+# (see vLLM's installation docs), then repeat the check
+pip install -e ./dg_topk_plugin                      # our plugin; inactive unless DG_TOPK_SC_K is set
+pip install nbconvert ipykernel pandas matplotlib datasets
 python -m ipykernel install --user --name anlp-vllm
-jupyter nbconvert --to notebook --execute --output 08_sampler_microbenchmark_vllm.ipynb \
-  --ExecutePreprocessor.kernel_name=anlp-vllm --ExecutePreprocessor.timeout=-1 08_sampler_microbenchmark.ipynb
 ```
-
-Success criteria (section 2b of the notebook): argmax and sample identical, entropy and probs differences at rounding level (~1e-6 or smaller). In the Summary table, `copy vs installed kernel (ratio)` should be close to 1, and `speedup vs installed vllm (k=64)` is the headline number.
 
 ## 2. Notebook 07: exactness checks and GSM8K (2 GPUs, bf16 model)
 
@@ -83,10 +80,28 @@ Run order, and what to look for:
 
 Report back: the pad-check table, Test A and Test B tables, and the GSM8K summary + paired comparison.
 
-## 3. After a run
+## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 GPUs, ~2-3 hours)
+
+Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). It starts one vLLM server (tensor parallel 2) per configuration and `--max-num-seqs` value, sends GSM8K questions at that concurrency, and stops the server again. Settings at the top of the first code cell: `GPUS`, `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]).
 
 ```bash
-git add 08_sampler_microbenchmark.ipynb 07_certified_full_pipeline.ipynb
+source .venv-vllm/bin/activate
+nohup jupyter nbconvert --to notebook --execute --inplace \
+  --ExecutePreprocessor.kernel_name=anlp-vllm --ExecutePreprocessor.timeout=-1 09_vllm_end_to_end.ipynb > nb09.log 2>&1 &
+```
+
+Outputs: `runs/nb09/e2e.csv`, `runs/nb09/e2e.png`, one server log per run in `runs/nb09/`.
+
+Success criteria:
+- Kernel check: argmax and sample identical, entropy/probs differences at rounding level, copy/vLLM time ratio near 1.
+- `plugin_active` is True on every `topk64` row (the plugin loaded in the server).
+- Accuracy of `stock` and `topk64` within noise of each other.
+- Report the throughput table with `speedup`, the latency plot, and the largest `--max-num-seqs` that started for each config. A `failed_to_start` row with `oom=True` at large batch limits is a result, not an error.
+
+## 4. After a run
+
+```bash
+git add 08_sampler_microbenchmark.ipynb 07_certified_full_pipeline.ipynb 09_vllm_end_to_end.ipynb
 git commit -m "Run outputs: notebook 08 sampler benchmark, notebook 07 checks (date)"
 git push
 ```

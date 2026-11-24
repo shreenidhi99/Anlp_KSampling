@@ -1,0 +1,82 @@
+"""vLLM general plugin: top-k self-conditioning for DiffusionGemma.
+
+Off unless the environment variable DG_TOPK_SC_K is set to a positive k (e.g. 64). Then, in every vLLM process:
+
+  * `sample_row_stats` runs the same fused statistics pass as vLLM (argmax, sample, entropy: identical for the
+    same seed, so commit / re-noise / stop decisions are unchanged) but does NOT write the full softmax. Instead it
+    returns the top-k token ids and their probabilities.
+  * `_store_self_conditioning` builds the self-conditioning soft embedding from those k rows of the embedding
+    table (an embedding_bag) instead of the full [rows, vocab] @ [vocab, hidden] matmul. Under tensor parallelism
+    each rank sums the top-k ids in its vocabulary shard and the partial sums are all-reduced, as in vLLM.
+
+DG_TOPK_SC_TAIL = renorm (default: weights rescaled to sum to 1) | drop (raw top-k probabilities).
+"""
+import logging
+import os
+
+logger = logging.getLogger("dg_topk_plugin")
+
+
+class TopKProbs:
+    """Stands in for vLLM's [rows, vocab] probs tensor: top-k ids and weights per row."""
+
+    def __init__(self, idx, w):
+        self.idx, self.w = idx, w
+
+    def view(self, *shape):                       # vLLM calls probs_rows.view(n, W, -1)
+        n, W = shape[0], shape[1]
+        return TopKProbs(self.idx.reshape(n, W, -1), self.w.reshape(n, W, -1))
+
+
+def register():
+    k = int(os.environ.get("DG_TOPK_SC_K", "0") or 0)
+    if k <= 0:
+        return
+    import torch
+    import torch.nn.functional as F
+    import vllm.model_executor.models.diffusion_gemma as dg
+    if getattr(dg, "_dg_topk_patched", False):
+        return
+    from .kernel import row_stats
+
+    tail = os.environ.get("DG_TOPK_SC_TAIL", "renorm")
+    orig_store = dg._store_self_conditioning
+    orig_stats = dg.sample_row_stats
+
+    def sample_row_stats(logits, temps, canvas_len, seed, probs_dtype):
+        argmax, sample, entropy, lse, _ = row_stats(logits, temps, canvas_len, seed, None)
+        if probs_dtype is None:                   # no self-conditioning needed this step
+            return argmax, sample, entropy, None
+        kk = min(k, logits.shape[-1])
+        vals, idx = torch.topk(logits, kk, dim=-1)
+        inv = (1.0 / temps.float().clamp_min(1e-10)).repeat_interleave(canvas_len)
+        p = torch.exp(vals.float() * inv[:, None] - lse[:, None])
+        if tail == "renorm":
+            p = p / p.sum(-1, keepdim=True)
+        return argmax, sample, entropy, TopKProbs(idx, p)
+
+    def _store_self_conditioning(sc_embeds, decode_slots, keep, probs, pin_mask, embed_weight, normalizer,
+                                 sc_vocab_start, sc_vocab_end, tp_size, tp_group_name):
+        if not isinstance(probs, TopKProbs):
+            return orig_store(sc_embeds, decode_slots, keep, probs, pin_mask, embed_weight, normalizer,
+                              sc_vocab_start, sc_vocab_end, tp_size, tp_group_name)
+        n, W, kk = probs.idx.shape
+        idx = probs.idx.reshape(-1, kk)
+        w = probs.w.reshape(-1, kk)
+        local = (idx >= sc_vocab_start) & (idx < sc_vocab_end)       # ids in this rank's vocabulary shard
+        lidx = torch.where(local, idx - sc_vocab_start, torch.zeros_like(idx))
+        lw = torch.where(local, w, torch.zeros_like(w)).to(embed_weight.dtype)
+        table = embed_weight[: sc_vocab_end - sc_vocab_start]
+        soft = F.embedding_bag(lidx, table, per_sample_weights=lw, mode="sum").view(n, W, -1)
+        if tp_size > 1:
+            soft = torch.ops.vllm.all_reduce(soft, group_name=tp_group_name)
+        keep2 = keep[:, None, None] & ~pin_mask[decode_slots, :, None]
+        sc_embeds[decode_slots] = (soft * normalizer * keep2).to(sc_embeds.dtype)
+
+    # the model calls sample_row_stats.register_warmup() at init; keep vLLM's warmup of its own kernel
+    if hasattr(orig_stats, "register_warmup"):
+        sample_row_stats.register_warmup = orig_stats.register_warmup
+    dg.sample_row_stats = sample_row_stats
+    dg._store_self_conditioning = _store_self_conditioning
+    dg._dg_topk_patched = True
+    logger.warning("[dg_topk] top-k self-conditioning enabled: k=%d, tail=%s (pid %d)", k, tail, os.getpid())

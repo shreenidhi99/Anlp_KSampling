@@ -1,4 +1,4 @@
-The notebooks at a glance (01-08)
+The notebooks at a glance (01-09)
 #	Notebook	Needs the model?	GPU	Answers
 01	topk sampling harness	No	1 GPU (T4 or better)	Is sampling expensive, and does top-k fix it?
 02	diffusers smoke test	Yes (bf16, multi-GPU split)	2+ A100s	Does the model run, and does my scheduler reproduce the stock decisions?
@@ -8,6 +8,7 @@ The notebooks at a glance (01-08)
 06	vllm tensor parallel sweep	Yes (bf16)	2 A100s	Where does AR overtake diffusion in real serving?
 07	certified full pipeline	Yes (bf16)	2+ A100s	Commit, stop and self-conditioning patched inside the real diffusers pipeline: exactness (shadow test) and GSM8K
 08	sampler microbenchmark	No (logits + embedding table)	1 A100	vLLM's fused sampler with the full self-conditioning hint vs. a top-k hint: time and memory vs. batch size
+09	vllm end to end	Yes (bf16, vLLM tensor parallel 2)	2 A100s	DiffusionGemma served by vLLM, stock vs. top-k self-conditioning (via dg_topk_plugin): throughput, latency, accuracy, largest batch that fits
 
 01: topk sampling harness
 

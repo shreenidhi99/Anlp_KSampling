@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dg-topk-plugin"
+version = "0.1.0"
+description = "vLLM general plugin: top-k self-conditioning for DiffusionGemma (opt-in via DG_TOPK_SC_K)"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+dg_topk = "dg_topk_plugin:register"
+
+[tool.setuptools]
+packages = ["dg_topk_plugin"]
