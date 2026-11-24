@@ -413,7 +413,10 @@ def load_vllm_kernel():
     Returns (function, version string) or (None, reason)."""
     try:
         import vllm
-        from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats
+        try:                                    # main branch: a separate sampler module
+            from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats
+        except ImportError:                     # vLLM 0.31.0: the function lives in the model module
+            from vllm.model_executor.models.diffusion_gemma import sample_row_stats
         return sample_row_stats, getattr(vllm, '__version__', '?')
     except Exception as e:                      # not installed, or a version without DiffusionGemma
         return None, f'{type(e).__name__}: {e}'
