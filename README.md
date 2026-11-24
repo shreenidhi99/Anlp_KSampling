@@ -1,4 +1,4 @@
-The notebooks at a glance (01-09)
+The notebooks at a glance (01-10)
 #	Notebook	Needs the model?	GPU	Answers
 01	topk sampling harness	No	1 GPU (T4 or better)	Is sampling expensive, and does top-k fix it?
 02	diffusers smoke test	Yes (bf16, multi-GPU split)	2+ A100s	Does the model run, and does my scheduler reproduce the stock decisions?
@@ -9,6 +9,8 @@ The notebooks at a glance (01-09)
 07	certified full pipeline	Yes (bf16)	2+ A100s	Commit, stop and self-conditioning patched inside the real diffusers pipeline: exactness (shadow test) and GSM8K
 08	sampler microbenchmark	No (logits + embedding table)	1 A100	vLLM's fused sampler with the full self-conditioning hint vs. a top-k hint: time and memory vs. batch size
 09	vllm end to end	Yes (bf16, vLLM tensor parallel 2)	2 A100s	DiffusionGemma served by vLLM, stock vs. top-k self-conditioning (via dg_topk_plugin): throughput, latency, accuracy, largest batch that fits
+09a	plugin smoke test	No (logits + embedding table)	1 GPU (~5 GB)	The dg_topk plugin inside the installed vLLM: loads via vLLM's plugin loader, identical decisions to vLLM's functions, hint within ~0.1%, constrained steps
+10	profiling	Parts A/B no; Part C yes	1 GPU (A/B), 2+ GPUs (C)	Nsight Compute on the sampler kernels, a noise ablation (random numbers vs logarithms), and vLLM's built-in profiler: the sampler's share of a real denoising step
 
 01: topk sampling harness
 
@@ -127,3 +129,23 @@ Problems found while running the notebooks, newest last. Each entry: what happen
 10. vLLM and SGLang already fuse most of the sampler (2026-11-23)
    - vLLM's DiffusionGemma sampler (vllm/model_executor/models/diffusion_gemma_sampler.py) reads each logits row once in a Triton kernel (argmax, Gumbel sample, exact entropy), fuses the commit/stop logic into a second kernel, and tiles requests to fit memory. SGLang (python/sglang/srt/dllm/algorithm/gemma4_renoise.py) uses torch.compile for the statistics and one host sync per step.
    - Both still write the full softmax and run the full self-conditioning matmul (256 x 262,144 x 2,816 per sequence per step). Notebook 08 measures what a top-k hint saves against vLLM's path; that saving, not the certified commit/stop, is the main remaining opportunity in an optimized engine.
+
+Profiling needs (notebook 10)
+
+What each part needs, and what to ask for on a shared machine:
+
+| Part | Tool | Needs | If it is missing |
+|---|---|---|---|
+| A: kernel profile | Nsight Compute (`ncu`, ships with the CUDA toolkit, e.g. `/usr/local/cuda/bin/ncu`) | 1 GPU with ~4 GB free; **permission to read GPU performance counters** | `ERR_NVGPUCTRPERM` means counters are admin-only. Ask the admin to set the NVIDIA driver option `NVreg_RestrictProfilingToAdminUsers=0` (or run `ncu` with sudo). Otherwise rely on Part B |
+| B: noise ablation | none (CUDA-event timing in `profile_kernels.py --ablation`) | 1 GPU with ~4 GB free | always runs |
+| C: step breakdown in vLLM | vLLM's built-in PyTorch profiler (`--profiler-config`, `/start_profile`, `/stop_profile`) | `.venv-vllm` with the plugin; 2 GPUs with ~36 GB free each; ~1-3 GB disk per trace in `runs/nb10/` | if this vLLM version names the flag differently: `vllm serve --help \| grep -i profil` |
+
+Optional: Nsight Systems (`nsys`) for timeline views of a whole vLLM run (`nsys profile -o run vllm serve ...`); not required by the notebooks. Traces from Part C open in Perfetto (ui.perfetto.dev) or TensorBoard.
+
+Quick checks before running:
+
+```bash
+ncu --version                                   # Nsight Compute present?
+nvidia-smi --query-gpu=index,memory.free --format=csv
+ls runs/nb04/step_*.pt                          # saved logits (Parts A/B, notebook 09a)
+```

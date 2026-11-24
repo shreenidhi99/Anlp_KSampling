@@ -1,4 +1,4 @@
-# Runbook: notebooks 08, 07 and 09
+# Runbook: notebooks 08, 07, 09, 09a and 10
 
 Step-by-step instructions for running the current experiments on the GPU machine. Written so that a person or a coding agent (e.g. Claude Code in the terminal or VS Code) can follow them top to bottom and report back.
 
@@ -84,6 +84,18 @@ Run order, and what to look for:
 
 Report back: the pad-check table, Test A and Test B tables, and the GSM8K summary + paired comparison.
 
+## 2b. Notebook 09a: plugin smoke test (1 GPU, ~5 GB, ~5 min, no model)
+
+Run this before notebook 09, or whenever GPUs 0/1 are busy. It needs `.venv-vllm` with the plugin installed and the saved logits in `runs/nb04/`.
+
+```bash
+source .venv-vllm/bin/activate
+jupyter nbconvert --to notebook --execute --inplace \
+  --ExecutePreprocessor.kernel_name=anlp-vllm --ExecutePreprocessor.timeout=-1 09a_plugin_smoke_test.ipynb
+```
+
+Success: plugin entry point registered and patched; mode `vllm` argmax and sample identical, entropy difference 0; hint vs vLLM's full hint ~0.1% mean; zeros where vLLM writes zeros; mode `topk_exact` argmax identical; constrained step runs.
+
 ## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 or 4 GPUs, ~2-3 hours with the AR servers)
 
 Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). For each configuration it starts **one** vLLM server with the largest `--max-num-seqs` that fits (trying the largest first; failed starts are recorded), sweeps the number of concurrent requests on that server, then stops it. One server per configuration keeps the GPUs reserved for the whole sweep on a shared machine. Settings at the top of the first code cell: `N_GPUS` (2 or 4: the tensor-parallel size; 4 also adds batch limits 32 and 64), `GPUS` (None = the N_GPUS GPUs with the most free memory; `--gpu-memory-utilization` is then set from their free memory), `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]). If the first cell warns that less than ~32 GB per GPU is free, free the GPUs before running.
@@ -105,10 +117,22 @@ Success criteria:
 - The `<config> / ar_mtp` throughput ratios: where each diffusion configuration falls behind AR with multi-token prediction (the paper puts stock at ~32 concurrent requests).
 - Report the throughput table with `speedup`, the latency plot, and the largest `--max-num-seqs` that started for each config. A `failed_to_start` row with `oom=True` at large batch limits is a result, not an error; compare the largest `--max-num-seqs` that started and the KV-cache memory between configurations.
 
+## 3b. Notebook 10: profiling (see README, "Profiling needs")
+
+Parts A and B need 1 GPU (~4 GB) and no model; Part C needs 2 GPUs and the model (set `RUN_PART_C = True`).
+
+```bash
+source .venv-vllm/bin/activate        # or .venv-2 for parts A/B only
+jupyter nbconvert --to notebook --execute --inplace \
+  --ExecutePreprocessor.kernel_name=anlp-vllm --ExecutePreprocessor.timeout=-1 10_profiling.ipynb
+```
+
+Report: Part A's metric table and pipe/stall table (or the `ERR_NVGPUCTRPERM` message), Part B's ablation table, and Part C's per-step breakdown.
+
 ## 4. After a run
 
 ```bash
-git add 08_sampler_microbenchmark.ipynb 07_certified_full_pipeline.ipynb 09_vllm_end_to_end.ipynb
+git add 08_sampler_microbenchmark.ipynb 07_certified_full_pipeline.ipynb 09_vllm_end_to_end.ipynb 09a_plugin_smoke_test.ipynb 10_profiling.ipynb
 git commit -m "Run outputs: notebook 08 sampler benchmark, notebook 07 checks (date)"
 git push
 ```
