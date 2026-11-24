@@ -87,9 +87,9 @@ def register():
         keep2 = keep[:, None, None] & ~pin_mask[decode_slots, :, None]
         sc_embeds[decode_slots] = (soft * normalizer * keep2).to(sc_embeds.dtype)
 
-    # Some vLLM versions call sample_row_stats.register_warmup() when the model is built: keep vLLM's warmup of its
-    # own kernel if it exists, otherwise a no-op, so the call never fails on the patched function.
-    sample_row_stats.register_warmup = getattr(orig_stats, "register_warmup", lambda *a, **kw: None)
+    # the model calls sample_row_stats.register_warmup() at init; keep vLLM's warmup of its own kernel
+    if hasattr(orig_stats, "register_warmup"):
+        sample_row_stats.register_warmup = orig_stats.register_warmup
     dg.sample_row_stats = sample_row_stats
     dg._store_self_conditioning = _store_self_conditioning
     dg._dg_topk_patched = True
