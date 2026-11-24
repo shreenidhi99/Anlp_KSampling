@@ -49,6 +49,8 @@ Success criteria:
 
 Report back: the correctness table, the `Summary` table, the memory table, and the plot.
 
+**Section 5 (fused top-k kernel, added 2026-11-24, ~15 more minutes):** first run of a new Triton kernel. If its check cell raises `fused kernel failed to compile or run`, report the full error message. Success: argmax and samples identical to vLLM's kernel, top-k id sets identical to `torch.topk` on (almost) all rows, hint error as in section 2. Then report the `Speed-up vs vLLM` table and the bandwidth table.
+
 ## 1b. vLLM environment (needed for notebook 09)
 
 Notebook 09 runs real vLLM. Keep it in a separate environment: installing vLLM pulls in its own PyTorch version and would change `.venv-2`. vLLM's DiffusionGemma recipe lists vLLM >= 0.24.0.
