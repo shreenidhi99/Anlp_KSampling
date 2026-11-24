@@ -62,10 +62,10 @@ cd /data/users/shreenis/private/Anlp_KSampling
 python3 -m venv .venv-vllm
 source .venv-vllm/bin/activate
 pip install -U pip
-pip install -U vllm
-python -c "import vllm; from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats; print(vllm.__version__, 'ok')"
-# if that import fails, this vLLM predates DiffusionGemma support: install a newer release or a nightly build
-# (see vLLM's installation docs), then repeat the check
+pip install vllm==0.31.0                             # the version the plugin and notebooks 09/09a were tested with
+python -c "import vllm, vllm.model_executor.models.diffusion_gemma as dg; print(vllm.__version__, hasattr(dg, '_compiled_sample_step') or hasattr(dg, '_store_self_conditioning'))"
+# must print "0.31.0 True". The plugin supports both sampler layouts: vLLM 0.31.0 (_compiled_sample_step, which also
+# computes self-conditioning) and the older/main-branch layout (_store_self_conditioning). Another version may work but is untested.
 pip install -e ./dg_topk_plugin                      # our plugin; inactive unless DG_TOPK_SC_K is set
 pip install nbconvert ipykernel pandas matplotlib datasets
 python -m ipykernel install --user --name anlp-vllm
