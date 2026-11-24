@@ -51,6 +51,8 @@ Report back: the correctness table, the `Summary` table, the memory table, and t
 
 **Section 5 (fused top-k kernel, added 2026-11-24, ~15 more minutes):** first run of a new Triton kernel. If its check cell raises `fused kernel failed to compile or run`, report the full error message. Success: argmax and samples identical to vLLM's kernel, top-k id sets identical to `torch.topk` on (almost) all rows, hint error as in section 2. Then report the `Speed-up vs vLLM` table and the bandwidth table.
 
+**Section 6 (exact top-k sampling, added 2026-11-24, ~10 more minutes):** report (1) the tie check: every differing row should show the same cut-off and a tie; (2) the distribution test: `freq_ours` close to `p_true`, about as close as `freq_torch_multinomial`, and similar total-variation distances; (3) the speed-up table and the bandwidth column.
+
 ## 1b. vLLM environment (needed for notebook 09)
 
 Notebook 09 runs real vLLM. Keep it in a separate environment: installing vLLM pulls in its own PyTorch version and would change `.venv-2`. vLLM's DiffusionGemma recipe lists vLLM >= 0.24.0.
@@ -82,7 +84,7 @@ Run order, and what to look for:
 
 Report back: the pad-check table, Test A and Test B tables, and the GSM8K summary + paired comparison.
 
-## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 GPUs, ~2-3 hours)
+## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 GPUs, ~1.5-3 hours)
 
 Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). It starts one vLLM server (tensor parallel 2) per configuration and `--max-num-seqs` value, sends GSM8K questions at that concurrency, and stops the server again. Settings at the top of the first code cell: `GPUS`, `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]).
 
@@ -94,10 +96,12 @@ nohup jupyter nbconvert --to notebook --execute --inplace \
 
 Outputs: `runs/nb09/e2e.csv`, `runs/nb09/e2e.png`, one server log per run in `runs/nb09/`.
 
+Three configurations: `stock`, `topk64` (fused top-k hint, vLLM's sampling: token-identical decisions) and `topk64_exact` (also exact top-k sampling without per-logit random numbers). The plugin is installed in editable mode, so `git pull` updates it; no reinstall needed.
+
 Success criteria:
 - Kernel check: argmax and sample identical, entropy/probs differences at rounding level, copy/vLLM time ratio near 1.
-- `plugin_active` is True on every `topk64` row (the plugin loaded in the server).
-- Accuracy of `stock` and `topk64` within noise of each other.
+- `plugin_active` is True on every `topk64` and `topk64_exact` row (the plugin loaded in the server; the log line also shows `sample=vllm` or `sample=topk_exact`).
+- Accuracy of all three configurations within noise of each other.
 - Report the throughput table with `speedup`, the latency plot, and the largest `--max-num-seqs` that started for each config. A `failed_to_start` row with `oom=True` at large batch limits is a result, not an error.
 
 ## 4. After a run

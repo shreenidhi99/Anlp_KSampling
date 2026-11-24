@@ -370,6 +370,43 @@ def path_topk_fused_nogumbel(L, temps, CL, E, scale, k=64, generator=None):
     return dict(argmax=argmax, sample=sample, entropy=ent, hint=hint_from_topk(topi, topp, E, scale))
 
 
+
+# ============================================================================ exact sampling from the top-k (no per-logit RNG)
+def tail_mass_from_topk(topp):
+    """Probability outside the top-k, accurate even when it is tiny: -expm1(log(sum top-k probs))."""
+    return (-torch.expm1(torch.log(topp.clamp_min(1e-38)).logsumexp(-1))).clamp_min(0.0)
+
+
+def sample_topk_exact(L, temps, CL, topi, topp, generator=None):
+    """Draw one token per row from the FULL softmax(L / T), using the top-k:
+    with probability (1 - tail mass) pick among the top-k (proportional to their probabilities), otherwise draw from
+    the tail (the full row with the top-k masked out). The tail branch is rare and touches only those rows.
+    Returns (tokens [rows] int64, number of tail draws)."""
+    rows = L.shape[0]
+    tm = tail_mass_from_topk(topp)
+    u = torch.rand(rows, device=L.device, generator=generator)
+    pick = torch.multinomial(topp / topp.sum(-1, keepdim=True), 1, generator=generator).squeeze(1)
+    tok = topi.gather(1, pick[:, None]).squeeze(1).long()
+    tail = u < tm
+    n_tail = int(tail.sum())
+    if n_tail:
+        r = tail.nonzero().squeeze(1)
+        inv = (1.0 / temps.float().clamp_min(1e-10)).repeat_interleave(CL)[r]
+        lt = L[r].float() * inv[:, None]
+        lt.scatter_(1, topi[r].long(), float('-inf'))
+        tok[r] = torch.multinomial(torch.softmax(lt, -1), 1, generator=generator).squeeze(1)
+    return tok, n_tail
+
+
+def path_topk_exact(L, temps, CL, E, scale, k=64, generator=None):
+    """Ours, fastest: fused statistics + top-k WITHOUT per-logit random numbers, exact sampling from the top-k with a
+    tail branch, and the k-row hint. Argmax and entropy are identical to vLLM's; the sampled tokens follow the same
+    distribution but use different random numbers."""
+    argmax, _, ent, topi, topp = row_stats_topk(L, temps, CL, k, do_sample=False)
+    sample, n_tail = sample_topk_exact(L, temps, CL, topi, topp, generator)
+    return dict(argmax=argmax, sample=sample, entropy=ent, hint=hint_from_topk(topi, topp, E, scale), n_tail=n_tail)
+
+
 # ============================================================================ the real vLLM kernel (optional)
 def load_vllm_kernel():
     """vLLM's own `sample_row_stats`, if vLLM (with DiffusionGemma support) is installed in this environment.
