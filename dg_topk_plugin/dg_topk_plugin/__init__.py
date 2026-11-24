@@ -5,9 +5,9 @@ Off unless the environment variable DG_TOPK_SC_K is set to a positive k (e.g. 64
   * `sample_row_stats` runs the same fused statistics pass as vLLM (argmax, sample, entropy: identical for the
     same seed, so commit / re-noise / stop decisions are unchanged) but does NOT write the full softmax. Instead it
     returns the top-k token ids and their probabilities.
-  * `_store_self_conditioning` builds the self-conditioning soft embedding from those k rows of the embedding
-    table (an embedding_bag) instead of the full [rows, vocab] @ [vocab, hidden] matmul. Under tensor parallelism
-    each rank sums the top-k ids in its vocabulary shard and the partial sums are all-reduced, as in vLLM.
+  * The self-conditioning store helper (or, in current vLLM, the compiled-step adapter) builds the soft embedding
+    from those k rows of the embedding table instead of the full [rows, vocab] @ [vocab, hidden] matmul. Under
+    tensor parallelism each rank sums the top-k ids in its vocabulary shard and the partial sums are all-reduced.
 
 DG_TOPK_SC_TAIL = renorm (default: weights rescaled to sum to 1) | drop (raw top-k probabilities).
 DG_TOPK_SAMPLE  = vllm (default: vLLM's per-logit Gumbel sample, identical tokens to stock vLLM for the same seed)
@@ -15,6 +15,8 @@ DG_TOPK_SAMPLE  = vllm (default: vLLM's per-logit Gumbel sample, identical token
                   same token distribution, different random numbers, ~4x faster statistics pass)
 k must be a power of two (the fused kernel's running top-k).
 """
+import functools
+import inspect
 import logging
 import os
 
@@ -39,8 +41,6 @@ def register():
     import torch
     import torch.nn.functional as F
     import vllm.model_executor.models.diffusion_gemma as dg
-    if getattr(dg, "_dg_topk_patched", False):
-        return
     from .kernel import row_stats, row_stats_topk, sample_topk_exact
 
     tail = os.environ.get("DG_TOPK_SC_TAIL", "renorm")
@@ -49,8 +49,23 @@ def register():
         raise ValueError(f"DG_TOPK_SC_K must be a power of two, got {k}")
     if mode not in ("vllm", "topk_exact"):
         raise ValueError(f"DG_TOPK_SAMPLE must be vllm or topk_exact, got {mode}")
-    orig_store = dg._store_self_conditioning
-    orig_stats = dg.sample_row_stats
+    config = (k, tail, mode)
+    state = getattr(dg, "_dg_topk_plugin_state", None)
+    if state is not None:
+        orig_store = state["orig_store"]
+        orig_stats = state["orig_stats"]
+        orig_step = state["orig_step"]
+        if state["config"] == config:
+            return
+    else:
+        orig_store = getattr(dg, "_store_self_conditioning", None)
+        orig_stats = dg.sample_row_stats
+        orig_step = getattr(dg, "_compiled_sample_step", None)
+        if orig_store is None and orig_step is None:
+            raise RuntimeError(
+                "Unsupported vLLM DiffusionGemma sampler: expected "
+                "_store_self_conditioning or _compiled_sample_step"
+            )
 
     def sample_row_stats(logits, temps, canvas_len, seed, probs_dtype):
         if probs_dtype is None and mode == "vllm":          # no self-conditioning needed and vLLM's sampling
@@ -72,25 +87,70 @@ def register():
     def _store_self_conditioning(sc_embeds, decode_slots, keep, probs, pin_mask, embed_weight, normalizer,
                                  sc_vocab_start, sc_vocab_end, tp_size, tp_group_name):
         if not isinstance(probs, TopKProbs):
-            return orig_store(sc_embeds, decode_slots, keep, probs, pin_mask, embed_weight, normalizer,
-                              sc_vocab_start, sc_vocab_end, tp_size, tp_group_name)
-        n, W, kk = probs.idx.shape
-        idx = probs.idx.reshape(-1, kk)
-        w = probs.w.reshape(-1, kk)
-        local = (idx >= sc_vocab_start) & (idx < sc_vocab_end)       # ids in this rank's vocabulary shard
-        lidx = torch.where(local, idx - sc_vocab_start, torch.zeros_like(idx))
-        lw = torch.where(local, w, torch.zeros_like(w)).to(embed_weight.dtype)
-        table = embed_weight[: sc_vocab_end - sc_vocab_start]
-        soft = F.embedding_bag(lidx, table, per_sample_weights=lw, mode="sum").view(n, W, -1)
+            if orig_store is not None:
+                return orig_store(sc_embeds, decode_slots, keep, probs, pin_mask, embed_weight, normalizer,
+                                  sc_vocab_start, sc_vocab_end, tp_size, tp_group_name)
+            local_probs = probs[..., sc_vocab_start:sc_vocab_end].to(embed_weight.dtype)
+            soft = torch.matmul(local_probs, embed_weight[: sc_vocab_end - sc_vocab_start])
+        else:
+            n, W, kk = probs.idx.shape
+            idx = probs.idx.reshape(-1, kk)
+            w = probs.w.reshape(-1, kk)
+            local = (idx >= sc_vocab_start) & (idx < sc_vocab_end)
+            lidx = torch.where(local, idx - sc_vocab_start, torch.zeros_like(idx))
+            lw = torch.where(local, w, torch.zeros_like(w)).to(embed_weight.dtype)
+            table = embed_weight[: sc_vocab_end - sc_vocab_start]
+            soft = F.embedding_bag(lidx, table, per_sample_weights=lw, mode="sum").view(n, W, -1)
         if tp_size > 1:
             soft = torch.ops.vllm.all_reduce(soft, group_name=tp_group_name)
-        keep2 = keep[:, None, None] & ~pin_mask[decode_slots, :, None]
-        sc_embeds[decode_slots] = (soft * normalizer * keep2).to(sc_embeds.dtype)
+        keep_mask = keep[:, None, None] & ~pin_mask[decode_slots, :, None]
+        sc_embeds[decode_slots] = (soft * normalizer * keep_mask).to(sc_embeds.dtype)
+
+    def compiled_sample_step(*args, **kwargs):
+        bound = step_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        probs = values["probs"]
+        if not isinstance(probs, TopKProbs):
+            return orig_step(*args, **kwargs)
+        if not values["compute_sc"]:
+            raise RuntimeError("TopKProbs was provided while compute_sc is false")
+
+        decode_slots = values["decode_slots"]
+        was_denoising = ~values["is_encoder_phase"][decode_slots]
+        bound.arguments["probs"] = None
+        bound.arguments["compute_sc"] = False
+        result = orig_step(*bound.args, **bound.kwargs)
+
+        keep = was_denoising & ~values["is_encoder_phase"][decode_slots]
+        _store_self_conditioning(
+            values["sc_embeds"],
+            decode_slots,
+            keep,
+            probs,
+            values["pin_mask"],
+            values["embed_weight"],
+            values["normalizer"],
+            values["sc_vocab_start"],
+            values["sc_vocab_end"],
+            values["tp_size"],
+            values["tp_group_name"],
+        )
+        return result
 
     # the model calls sample_row_stats.register_warmup() at init; keep vLLM's warmup of its own kernel
     if hasattr(orig_stats, "register_warmup"):
         sample_row_stats.register_warmup = orig_stats.register_warmup
     dg.sample_row_stats = sample_row_stats
     dg._store_self_conditioning = _store_self_conditioning
+    if orig_store is None:
+        step_signature = inspect.signature(orig_step)
+        dg._compiled_sample_step = functools.wraps(orig_step)(compiled_sample_step)
     dg._dg_topk_patched = True
+    dg._dg_topk_plugin_state = {
+        "config": config,
+        "orig_stats": orig_stats,
+        "orig_store": orig_store,
+        "orig_step": orig_step,
+    }
     logger.warning("[dg_topk] top-k self-conditioning enabled: k=%d, tail=%s, sample=%s (pid %d)", k, tail, mode, os.getpid())
