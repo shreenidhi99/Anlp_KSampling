@@ -1,11 +1,14 @@
-The notebooks at a glance (01-07)
+The notebooks at a glance (01-08)
 #	Notebook	Needs the model?	GPU	Answers
 01	topk sampling harness	No	1 GPU (T4 or better)	Is sampling expensive, and does top-k fix it?
-02	diffusers smoke test	Yes (4-bit)	1 A100	Does the model run, and does my scheduler reproduce the stock decisions?
+02	diffusers smoke test	Yes (bf16, multi-GPU split)	2+ A100s	Does the model run, and does my scheduler reproduce the stock decisions?
 03	certified topk sampler	No	1 GPU	Does the certified method give identical decisions?
-04	bf16 two gpu split	Yes (bf16)	Both A100s	Does certification hold on real, unquantized logits, and is accuracy unchanged?
-05	single gpu speed tests	Yes (4-bit/int8)	1 A100	How much faster and smaller is the sampler on real data?
-06	vllm tensor parallel sweep	Yes (bf16)	Both A100s	Where does AR overtake diffusion in real serving?
+04	bf16 two gpu split	Yes (bf16)	2+ A100s	Does certification hold on real, unquantized logits, and is accuracy unchanged?
+05	single gpu speed tests	(superseded by 08)	-	The model does not fit on one 40 GB A100 (experts are not quantized by bitsandbytes)
+06	vllm tensor parallel sweep	Yes (bf16)	2 A100s	Where does AR overtake diffusion in real serving?
+07	certified full pipeline	Yes (bf16)	2+ A100s	Commit, stop and self-conditioning patched inside the real diffusers pipeline: exactness (shadow test) and GSM8K
+08	sampler microbenchmark	No (logits + embedding table)	1 A100	vLLM's fused sampler with the full self-conditioning hint vs. a top-k hint: time and memory vs. batch size
+
 01: topk sampling harness
 
 Input: synthetic logits with DiffusionGemma’s shape (batch × 256 × 262,144).
@@ -113,3 +116,13 @@ Problems found while running the notebooks, newest last. Each entry: what happen
 
 8. Notebook 02: certified GSM8K-250 row still from buggy bounds (open)
    - Its inline topk_stats was never fixed (issue 4). Use notebook 07 for the certified GSM8K numbers instead.
+
+9. Fixes across notebooks (2026-11-23)
+   - Notebook 02: its inline topk_stats now uses the float64 bounds and the 2e-5 pad (issue 4). Its certified GSM8K-250 row predates this; rerun it or use notebook 07.
+   - Notebook 05: marked superseded; speed is measured in notebook 08.
+   - Notebook 07: (a) DETERMINISTIC switch (CUBLAS_WORKSPACE_CONFIG + torch.use_deterministic_algorithms(warn_only=True)) so Test A can compare runs token by token; (b) the GSM8K table now records peak_extra_gb, the memory generation adds on top of the loaded model per GPU (peak_gb only showed the model weights, identical for every config).
+   - Open: the certified sampler in dg_certified.py loops over sequences in Python with small GPU syncs; fine for correctness at batch 1, but it must be vectorized before any batched timing. Notebook 08 times the top-k self-conditioning path, which has no such loop.
+
+10. vLLM and SGLang already fuse most of the sampler (2026-11-23)
+   - vLLM's DiffusionGemma sampler (vllm/model_executor/models/diffusion_gemma_sampler.py) reads each logits row once in a Triton kernel (argmax, Gumbel sample, exact entropy), fuses the commit/stop logic into a second kernel, and tiles requests to fit memory. SGLang (python/sglang/srt/dllm/algorithm/gemma4_renoise.py) uses torch.compile for the statistics and one host sync per step.
+   - Both still write the full softmax and run the full self-conditioning matmul (256 x 262,144 x 2,816 per sequence per step). Notebook 08 measures what a top-k hint saves against vLLM's path; that saving, not the certified commit/stop, is the main remaining opportunity in an optimized engine.
