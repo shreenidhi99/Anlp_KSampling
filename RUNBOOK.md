@@ -86,7 +86,7 @@ Report back: the pad-check table, Test A and Test B tables, and the GSM8K summar
 
 ## 3. Notebook 09: DiffusionGemma in vLLM, stock vs. top-k self-conditioning (2 GPUs, ~1.5-3 hours)
 
-Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). It starts one vLLM server (tensor parallel 2) per configuration and `--max-num-seqs` value, sends GSM8K questions at that concurrency, and stops the server again. Settings at the top of the first code cell: `GPUS` (None = the two GPUs with the most free memory; `--gpu-memory-utilization` is then set from their free memory), `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]). If the first cell warns that less than ~32 GB per GPU is free, free the GPUs before running.
+Needs **both A100s free** and the `.venv-vllm` environment with the plugin installed (section 1b). It starts one vLLM server (tensor parallel 2) per configuration and `--max-num-seqs` value, sends GSM8K questions at that concurrency, and stops the server again. Settings at the top of the first code cell: `N_GPUS` (2 or 4: the tensor-parallel size; 4 also adds batch limits 32 and 64), `GPUS` (None = the N_GPUS GPUs with the most free memory; `--gpu-memory-utilization` is then set from their free memory), `N_QUESTIONS` (100 by default), `MAX_SEQS` ([1, 2, 4, 8, 16]). If the first cell warns that less than ~32 GB per GPU is free, free the GPUs before running.
 
 ```bash
 source .venv-vllm/bin/activate
