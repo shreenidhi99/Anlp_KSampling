@@ -24,12 +24,15 @@ check "kernels anlp-ksampling and anlp-vllm registered" bash -c \
     "'$VENV_KS/bin/jupyter' kernelspec list | grep -q anlp-ksampling && '$VENV_KS/bin/jupyter' kernelspec list | grep -q anlp-vllm"
 
 echo "== ksampling env (07, 08)"
-check "torch, triton, transformers, diffusers, datasets import" "$VENV_KS/bin/python" -c "
-import torch, triton, transformers, diffusers, datasets, nbclient, pandas, matplotlib
-from transformers import DiffusionGemmaForBlockDiffusion
-from diffusers import DiffusionGemmaPipeline
-import hint_bench, dg_certified
-print(torch.__version__, triton.__version__, transformers.__version__, diffusers.__version__)"
+# Version checks only (fast). Real imports run in the GPU check job: the login node reads packages slowly.
+check "packages installed (requirements.txt versions)" "$VENV_KS/bin/python" -c "
+import importlib.metadata as md
+want = {'torch': '2.14.1', 'triton': '3.8.0', 'transformers': '5.20.2', 'diffusers': '0.41.0', 'datasets': '5.2.0'}
+got = {k: md.version(k) for k in want}
+bad = {k: (got[k], v) for k, v in want.items() if not got[k].startswith(v)}
+assert not bad, f'version mismatch (installed, wanted): {bad}'
+for k in ('nbclient', 'pandas', 'matplotlib', 'huggingface_hub'): md.version(k)
+print(got)"
 
 echo "== vLLM env (09a, 09, 10)"
 # No `import vllm` here: on a GPU-less login node it hangs probing for devices. The GPU check job imports it.
@@ -42,7 +45,9 @@ assert 'def sample_row_stats' in src, 'no sample_row_stats in the DiffusionGemma
 check "dg_topk plugin registered with vLLM" "$VENV_VLLM/bin/python" -c "
 import importlib.metadata as md
 assert any(e.name == 'dg_topk' for e in md.entry_points(group='vllm.general_plugins'))"
-check "openai, datasets, nbclient import" "$VENV_VLLM/bin/python" -c "import openai, datasets, nbclient, pandas, matplotlib"
+check "openai, datasets, nbclient, pandas, matplotlib installed" "$VENV_VLLM/bin/python" -c "
+import importlib.metadata as md
+for k in ('openai', 'datasets', 'nbclient', 'pandas', 'matplotlib'): md.version(k)"
 
 echo "== downloads (offline)"
 models="$MODEL_ID"; [ "$NB09_RUN_AR" = 1 ] && models="$models $AR_ID $AR_DRAFT_ID"
@@ -51,10 +56,7 @@ for m in $models; do
 from huggingface_hub import snapshot_download
 snapshot_download('$m', allow_patterns=['*.json', '*.safetensors'], local_files_only=True)"
 done
-for py in "$VENV_KS/bin/python" "$VENV_VLLM/bin/python"; do
-    check "GSM8K cached for $(basename "$(dirname "$(dirname "$py")")")" "$py" -c \
-        "from datasets import load_dataset; assert len(load_dataset('openai/gsm8k', 'main', split='test')) == 1319"
-done
+check "GSM8K cached" bash -c "ls -d '$HF_HOME'/datasets/openai___gsm8k/main/*/* >/dev/null 2>&1 || ls -d '$HF_HOME'/hub/datasets--openai--gsm8k >/dev/null"
 
 echo "== storage"
 df -h "$BIG_DIR" | tail -1 | awk '{print "  free on large storage: " $4}'

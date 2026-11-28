@@ -32,6 +32,14 @@ print('embedding table', key, tuple(E.shape))
 saved = hb.load_saved_logits('./runs/nb04/step_*.pt')
 assert len(saved) == 6 and saved[0][0].shape[-1] == E.shape[0], 'saved logits missing or wrong vocabulary'
 print('saved logits', [tuple(L.shape) for L, _ in saved][:2], '...')
+
+from transformers import DiffusionGemmaForBlockDiffusion, AutoProcessor
+from diffusers import DiffusionGemmaPipeline
+import dg_certified, nbclient
+AutoProcessor.from_pretrained(os.environ['MODEL_ID'])
+from datasets import load_dataset
+assert len(load_dataset('openai/gsm8k', 'main', split='test')) == 1319
+print('transformers/diffusers DiffusionGemma classes, processor, dg_certified, GSM8K (offline): ok')
 EOF
 
 echo "== vLLM env: CUDA, vLLM sampler kernels, the plugin"
@@ -46,6 +54,11 @@ load_general_plugins()
 assert getattr(dg, '_dg_topk_patched', False), 'dg_topk plugin did not patch vLLM'
 print('vllm', vllm.__version__, '| plugin patched vLLM')
 x = torch.randn(4, 1024, device='cuda').softmax(-1); print('cuda op ok', float(x.sum()))
+from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats
+import openai, nbclient
+from datasets import load_dataset
+assert len(load_dataset('openai/gsm8k', 'main', split='test')) == 1319
+print('sampler import, openai, GSM8K (offline): ok')
 EOF
 
 echo "== ncu (notebook 10 Part A; optional)"
