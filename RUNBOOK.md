@@ -2,6 +2,8 @@
 
 Step-by-step instructions for running the current experiments on the GPU machine. Written so that a person or a coding agent (e.g. Claude Code in the terminal or VS Code) can follow them top to bottom and report back.
 
+**On NCSA Delta (Slurm), use the "Running on NCSA Delta" section at the end instead of sections 0-3.**
+
 ## 0. Setup (once)
 
 ```bash
@@ -138,3 +140,40 @@ git push
 ```
 
 `runs/` is git-ignored, so copy any CSV or PNG you want to keep into the notebook outputs or attach them separately.
+
+## Running on NCSA Delta
+
+Everything lives in `delta/`. Jobs run on compute nodes through Slurm; the login node has no GPU. All downloads happen on the login node first, so jobs run offline, and each notebook runs into a copy (`delta/logs/<name>-<jobid>.ipynb`) that replaces the notebook only if every cell succeeds.
+
+| Job | Notebook(s) | GPUs | Node | Time limit |
+|---|---|---|---|---|
+| `check` | sanity check of both environments | 1 | shared | 20 min |
+| `nb08` | 08 sampler microbenchmark | 1 | shared (billed 1 GPU; `NB08_EXCLUSIVE=1` for a whole node) | 3 h |
+| `nb07` | 07 certified pipeline + GSM8K-250 (4 configs) | 4 | whole node | 10 h |
+| `nb09` | 09a smoke test, then 09 vLLM end to end (TP 4, with AR references) | 4 | whole node | 10 h |
+| `nb10` | 10 profiling, Parts A/B/C (Part C at TP 4) | 4 | whole node | 4 h |
+
+nb07 and nb09 append results to CSVs, so if one hits its time limit, resubmit it and it resumes.
+
+Once (login node):
+
+```bash
+git clone -b ncsa-delta https://github.com/shreenidhi99/Anlp_KSampling.git ~/Anlp_KSampling
+cd ~/Anlp_KSampling
+accounts                                   # copy the GPU account (xxxx-delta-gpu) into DELTA_ACCOUNT in delta/config.sh
+bash delta/setup_env.sh                    # both environments + Jupyter kernels (~20 min)
+# on your laptop (Git Bash):  bash delta/upload_logits.sh      -> the 6 saved logits steps
+$BIG_DIR/venv-ksampling/bin/hf auth login  # path is printed by setup_env.sh; paste your HF token
+nohup bash delta/prefetch.sh > delta/logs/prefetch.log 2>&1 &    # ~110 GB of models + GSM8K
+```
+
+Then, each time:
+
+```bash
+bash delta/preflight.sh                    # must print PREFLIGHT PASSED
+bash delta/submit.sh check                 # 15-min GPU check; log must end with GPU CHECK PASSED
+bash delta/submit_all.sh                   # the four jobs, in parallel
+squeue -u $USER                            # watch; logs in delta/logs/
+```
+
+Settings (GSM8K size, configs, AR on/off, exclusive nb08) are at the top of `delta/config.sh`. If the GPU check says torch cannot see the GPU, the driver is older than CUDA 13: set `TORCH_INDEX` to the cu128 index in `delta/config.sh` and rerun `setup_env.sh`.
