@@ -7,4 +7,4 @@ set -euo pipefail
 TGZ="${1:-$HOME/Downloads/nb04_logits.tgz}"
 [ -f "$TGZ" ] || { echo "not found: $TGZ"; exit 1; }
 scp "$TGZ" delta:nb04_logits.tgz
-ssh delta 'if [ -d ~/Anlp_KSampling/runs ]; then cd ~/Anlp_KSampling && tar -xzf ~/nb04_logits.tgz && rm ~/nb04_logits.tgz && ls -la runs/nb04/; else echo "uploaded to ~/nb04_logits.tgz; setup_env.sh will unpack it"; fi'
+ssh delta 'if [ -d ~/Anlp_KSampling/runs ]; then cd ~/Anlp_KSampling && tar -xzf ~/nb04_logits.tgz -C "$(dirname "$(readlink -f runs)")" && rm ~/nb04_logits.tgz && ls -la runs/nb04/; else echo "uploaded to ~/nb04_logits.tgz; setup_env.sh will unpack it"; fi'

@@ -42,7 +42,9 @@ VIRTUAL_ENV="$VENV_VLLM" uv pip install --python "$VENV_VLLM/bin/python" \
 echo
 n=$( (ls runs/nb04/step_*.pt 2>/dev/null || true) | wc -l)
 if [ "$n" -eq 0 ] && [ -f "$HOME/nb04_logits.tgz" ]; then
-    tar -xzf "$HOME/nb04_logits.tgz" -C "$REPO_DIR" && rm "$HOME/nb04_logits.tgz"
+    # archive paths are runs/nb04/...; runs/ is a link to $BIG_DIR/runs, so unpack there directly
+    # (tar cannot write through a link that crosses file systems)
+    tar -xzf "$HOME/nb04_logits.tgz" -C "$(dirname "$(readlink -f runs)")" && rm "$HOME/nb04_logits.tgz"
     n=$(ls runs/nb04/step_*.pt | wc -l)
 fi
 echo "saved logits in runs/nb04: $n of 6"
