@@ -32,9 +32,13 @@ import hint_bench, dg_certified
 print(torch.__version__, triton.__version__, transformers.__version__, diffusers.__version__)"
 
 echo "== vLLM env (09a, 09, 10)"
-check "vllm 0.31.0 with the DiffusionGemma sampler" "$VENV_VLLM/bin/python" -c "
-import vllm; assert vllm.__version__.startswith('0.31.0'), vllm.__version__
-from vllm.model_executor.models.diffusion_gemma_sampler import sample_row_stats"
+# No `import vllm` here: on a GPU-less login node it hangs probing for devices. The GPU check job imports it.
+check "vllm 0.31.0 with the DiffusionGemma sampler (installed files)" "$VENV_VLLM/bin/python" -c "
+import importlib.metadata as md, importlib.util, os
+v = md.version('vllm'); assert v.startswith('0.31.0'), v
+root = os.path.dirname(importlib.util.find_spec('vllm').origin)
+src = open(os.path.join(root, 'model_executor', 'models', 'diffusion_gemma_sampler.py')).read()
+assert 'def sample_row_stats' in src, 'no sample_row_stats in the DiffusionGemma sampler'"
 check "dg_topk plugin registered with vLLM" "$VENV_VLLM/bin/python" -c "
 import importlib.metadata as md
 assert any(e.name == 'dg_topk' for e in md.entry_points(group='vllm.general_plugins'))"
