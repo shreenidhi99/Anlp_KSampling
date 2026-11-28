@@ -3,7 +3,7 @@
 
 # ---- FILL IN -------------------------------------------------------------------------------
 # Slurm account of the GPU allocation, as printed by `accounts` (looks like  abcd-delta-gpu).
-export DELTA_ACCOUNT="${DELTA_ACCOUNT:-FILL_IN-delta-gpu}"
+export DELTA_ACCOUNT="${DELTA_ACCOUNT:-bjop-delta-gpu}"
 # GPU partition. gpuA100x4 = nodes with 4x A100 40 GB (what the notebooks are sized for). `sinfo -s` lists all.
 export DELTA_PARTITION="${DELTA_PARTITION:-gpuA100x4}"
 # --------------------------------------------------------------------------------------------
