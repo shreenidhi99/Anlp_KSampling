@@ -40,7 +40,7 @@ VIRTUAL_ENV="$VENV_VLLM" uv pip install --python "$VENV_VLLM/bin/python" \
 
 # ---- saved logits (uploaded by delta/upload_logits.sh) -----------------------------------------------
 echo
-n=$(ls runs/nb04/step_*.pt 2>/dev/null | wc -l)
+n=$( (ls runs/nb04/step_*.pt 2>/dev/null || true) | wc -l)
 if [ "$n" -eq 0 ] && [ -f "$HOME/nb04_logits.tgz" ]; then
     tar -xzf "$HOME/nb04_logits.tgz" -C "$REPO_DIR" && rm "$HOME/nb04_logits.tgz"
     n=$(ls runs/nb04/step_*.pt | wc -l)
